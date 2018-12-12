@@ -1,6 +1,6 @@
 use super::{Error, ErrorKind, PeerId, PeerIndex, ProtocolId};
 use bytes::Bytes;
-use ckb_util::{Mutex, RwLock};
+use ckb_util::RwLock;
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::sync::mpsc::UnboundedSender;
 use libp2p::core::{Endpoint, Multiaddr, UniqueConnec};
@@ -11,7 +11,6 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 
 struct PeerConnections {
@@ -150,7 +149,6 @@ pub(crate) struct PeersRegistry {
     // Only reserved peers or allow all peers.
     reserved_only: bool,
     reserved_peers: FnvHashSet<PeerId>,
-    deny_list: PeersDenyList,
 }
 
 fn find_most_peers_in_same_network_group<'a>(
@@ -185,7 +183,6 @@ impl PeersRegistry {
         for reserved_peer in reserved_peers {
             reserved_peers_set.insert(reserved_peer);
         }
-        let deny_list = PeersDenyList::new();
         PeersRegistry {
             peer_store,
             peers: Default::default(),
@@ -193,7 +190,6 @@ impl PeersRegistry {
             max_incoming,
             max_outgoing,
             reserved_only,
-            deny_list,
         }
     }
 
@@ -216,7 +212,7 @@ impl PeersRegistry {
                 ))
                 .into());
             }
-            if self.deny_list.is_denied(&peer_id) {
+            if self.peer_store.read().is_banned(&peer_id) {
                 return Err(
                     ErrorKind::InvalidNewPeer(format!("peer {:?} is denied", peer_id)).into(),
                 );
@@ -246,16 +242,17 @@ impl PeersRegistry {
             let mut lowest_score = std::i32::MAX;
             let mut low_score_peers = Vec::new();
             for (peer_id, _peer) in candidate_peers {
-                let peer_score = peer_store.peer_score(peer_id);
-                if peer_score > lowest_score {
-                    continue;
-                }
-                if peer_score < lowest_score {
-                    lowest_score = peer_score;
-                    low_score_peers.clear();
-                }
+                if let Some(score) = peer_store.peer_score(peer_id) {
+                    if score > lowest_score {
+                        continue;
+                    }
+                    if score < lowest_score {
+                        lowest_score = score;
+                        low_score_peers.clear();
+                    }
 
-                low_score_peers.push(peer_id);
+                    low_score_peers.push(peer_id);
+                }
             }
             // failed to evict
             if low_score_peers.is_empty() {
@@ -286,7 +283,7 @@ impl PeersRegistry {
                 ))
                 .into());
             }
-            if self.deny_list.is_denied(&peer_id) {
+            if self.peer_store.read().is_banned(&peer_id) {
                 return Err(
                     ErrorKind::InvalidNewPeer(format!("peer {:?} is denied", peer_id)).into(),
                 );
@@ -371,48 +368,5 @@ impl PeersRegistry {
     pub fn drop_all(&mut self) {
         debug!(target: "network", "drop_all");
         self.peers = Default::default();
-    }
-
-    pub(crate) fn ban_peer(&mut self, peer_id: PeerId, timeout: Duration) {
-        debug!(target: "network", "ban_peer: {:?}", peer_id);
-        self.drop_peer(&peer_id);
-        self.deny_list.ban_peer(peer_id, timeout);
-    }
-}
-
-struct PeersDenyList {
-    deny_list: Mutex<FnvHashMap<PeerId, Instant>>,
-    size: usize,
-}
-
-impl PeersDenyList {
-    pub fn new() -> Self {
-        PeersDenyList {
-            deny_list: Mutex::new(Default::default()),
-            size: 4096,
-        }
-    }
-
-    pub fn ban_peer(&self, peer_id: PeerId, timeout: Duration) {
-        let now = Instant::now();
-        let timeout_stamp = now + timeout;
-        let mut deny_list = self.deny_list.lock();
-        deny_list.insert(peer_id, timeout_stamp);
-        // release memories
-        if deny_list.len() > self.size {
-            deny_list.retain(move |_peer_id, &mut timeout| timeout < now);
-        }
-    }
-
-    pub fn is_denied(&self, peer_id: &PeerId) -> bool {
-        let mut deny_list = self.deny_list.lock();
-        if let Some(timeout) = deny_list.get(peer_id).cloned() {
-            if timeout > Instant::now() {
-                return true;
-            } else {
-                deny_list.remove(peer_id);
-            }
-        }
-        false
     }
 }
